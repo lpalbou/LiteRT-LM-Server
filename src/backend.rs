@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,7 +70,7 @@ impl Backend for MockBackend {
             .iter()
             .rev()
             .find_map(|m| m.content_text())
-            .unwrap_or("");
+            .unwrap_or_else(|| Cow::Borrowed(""));
 
         let prefix = session_id
             .map(|s| format!("[session:{s}] "))

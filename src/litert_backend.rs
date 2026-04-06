@@ -107,36 +107,23 @@ impl LitertBackend {
         let role = message.role.as_str();
         match role {
             "system" | "user" | "assistant" => {
-                let content = match message.content.as_ref() {
-                    None | Some(serde_json::Value::Null) => vec![],
-                    Some(serde_json::Value::String(s)) => vec![json!({"type":"text","text": s})],
-                    Some(serde_json::Value::Object(obj)) => {
-                        // Allow a single content part object (e.g. {"type":"text","text":"..."}).
-                        vec![serde_json::Value::Object(obj.clone())]
-                    }
-                    Some(serde_json::Value::Array(parts)) => parts
-                        .iter()
-                        .filter_map(|p| {
-                            let ty = p.get("type")?.as_str()?;
-                            if ty == "text" {
-                                let text = p.get("text")?.as_str()?;
-                                Some(json!({"type":"text","text": text}))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                    Some(other) => {
-                        return Err(BackendError::Unsupported(format!(
-                            "unsupported message content for role={role}: {other}"
-                        )));
-                    }
-                };
+                let content_parts = Self::to_litert_content_parts(role, message.content.as_ref())?;
 
-                Ok(json!({
+                let mut out = json!({
                   "role": role,
-                  "content": content,
-                }))
+                  "content": content_parts,
+                });
+
+                if role == "assistant" {
+                    if let Some(tool_calls) = message.tool_calls.as_ref() {
+                        let litert_tool_calls = Self::to_litert_tool_calls(tool_calls)?;
+                        if !litert_tool_calls.is_empty() {
+                            out["tool_calls"] = serde_json::Value::Array(litert_tool_calls);
+                        }
+                    }
+                }
+
+                Ok(out)
             }
             "tool" => {
                 // LiteRT-LM expects tool response content to be a JSON object.
@@ -165,6 +152,182 @@ impl LitertBackend {
                 "unsupported role: {other}"
             ))),
         }
+    }
+
+    fn to_litert_tool_calls(
+        tool_calls: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, BackendError> {
+        use serde_json::json;
+
+        let mut out = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let name = tool_call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let args_val = tool_call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String("{}".to_string()));
+
+            let args_obj = match args_val {
+                serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| json!({ "_raw": s })),
+                serde_json::Value::Object(_) => args_val,
+                other => json!({ "_raw": other }),
+            };
+
+            out.push(json!({
+              "type": "function",
+              "function": {
+                "name": name,
+                "arguments": args_obj,
+              }
+            }));
+        }
+        Ok(out)
+    }
+
+    fn to_litert_content_parts(
+        role: &str,
+        content: Option<&serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, BackendError> {
+        use serde_json::json;
+
+        let Some(content) = content else {
+            return Ok(vec![]);
+        };
+        if content.is_null() {
+            return Ok(vec![]);
+        }
+
+        match content {
+            serde_json::Value::String(s) => Ok(vec![json!({"type":"text","text": s})]),
+            serde_json::Value::Array(parts) => {
+                let mut out = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        serde_json::Value::String(s) => out.push(json!({"type":"text","text": s})),
+                        serde_json::Value::Object(_) => {
+                            out.push(Self::to_litert_content_part(part)?)
+                        }
+                        other => {
+                            return Err(BackendError::Unsupported(format!(
+                                "unsupported content part for role={role}: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            serde_json::Value::Object(_) => Ok(vec![Self::to_litert_content_part(content)?]),
+            other => Err(BackendError::Unsupported(format!(
+                "unsupported message content for role={role}: {other}"
+            ))),
+        }
+    }
+
+    fn to_litert_content_part(part: &serde_json::Value) -> Result<serde_json::Value, BackendError> {
+        use serde_json::json;
+
+        let ty = part
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::Unsupported("content part missing `type`".to_string()))?;
+
+        match ty {
+            "text" => {
+                let text = part.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                    BackendError::Unsupported("text part missing `text`".to_string())
+                })?;
+                Ok(json!({"type":"text","text": text}))
+            }
+            "image" => {
+                if let Some(path) = part.get("path").and_then(|v| v.as_str()) {
+                    return Ok(json!({"type":"image","path": path}));
+                }
+                if let Some(blob) = part.get("blob").and_then(|v| v.as_str()) {
+                    return Ok(json!({"type":"image","blob": blob}));
+                }
+                Err(BackendError::Unsupported(
+                    "image part requires `path` or `blob`".to_string(),
+                ))
+            }
+            "audio" => {
+                if let Some(path) = part.get("path").and_then(|v| v.as_str()) {
+                    return Ok(json!({"type":"audio","path": path}));
+                }
+                if let Some(blob) = part.get("blob").and_then(|v| v.as_str()) {
+                    return Ok(json!({"type":"audio","blob": blob}));
+                }
+                Err(BackendError::Unsupported(
+                    "audio part requires `path` or `blob`".to_string(),
+                ))
+            }
+            // OpenAI-style image input.
+            "image_url" => {
+                let url = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url").and_then(|u| u.as_str()).or_else(|| v.as_str()))
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("image_url part missing url".to_string())
+                    })?;
+                Self::image_url_to_litert_part(url)
+            }
+            // OpenAI-style audio input (not standard across all OpenAI clients, but common enough).
+            "input_audio" => {
+                let input_audio = part.get("input_audio").ok_or_else(|| {
+                    BackendError::Unsupported("input_audio part missing object".to_string())
+                })?;
+                let data = input_audio
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| input_audio.get("blob").and_then(|v| v.as_str()));
+                if let Some(blob) = data {
+                    return Ok(json!({"type":"audio","blob": blob}));
+                }
+                Err(BackendError::Unsupported(
+                    "input_audio requires `data` (base64)".to_string(),
+                ))
+            }
+            other => Err(BackendError::Unsupported(format!(
+                "unsupported content part type: {other}"
+            ))),
+        }
+    }
+
+    fn image_url_to_litert_part(url: &str) -> Result<serde_json::Value, BackendError> {
+        use serde_json::json;
+
+        if let Some(rest) = url.strip_prefix("data:") {
+            let marker = "base64,";
+            let idx = rest.find(marker).ok_or_else(|| {
+                BackendError::Unsupported(
+                    "data: image URLs must be base64 encoded (missing `base64,`)".to_string(),
+                )
+            })?;
+            let b64 = &rest[(idx + marker.len())..];
+            return Ok(json!({"type":"image","blob": b64}));
+        }
+
+        if let Some(path) = url.strip_prefix("file://") {
+            return Ok(json!({"type":"image","path": path}));
+        }
+
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return Err(BackendError::Unsupported(
+                "remote image URLs are not supported; use a local path or a data: URL".to_string(),
+            ));
+        }
+
+        // Treat anything else as a local filesystem path.
+        Ok(json!({"type":"image","path": url}))
     }
 
     fn extract_text_and_tool_calls(
@@ -224,24 +387,26 @@ impl LitertBackend {
         (content_text, tool_calls)
     }
 
-    fn tools_json(request: &ChatCompletionRequest) -> Option<String> {
-        request
-            .tools
-            .as_ref()
-            .and_then(|t| serde_json::to_string(t).ok())
+    fn tools_json(request: &ChatCompletionRequest) -> Result<Option<String>, BackendError> {
+        match request.tools.as_ref() {
+            None => Ok(None),
+            Some(t) => serde_json::to_string(t)
+                .map(Some)
+                .map_err(|e| BackendError::Internal(e.to_string())),
+        }
     }
 
-    fn history_json(history: &[ChatMessage]) -> Option<String> {
+    fn history_json(history: &[ChatMessage]) -> Result<Option<String>, BackendError> {
         if history.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut out = Vec::with_capacity(history.len());
         for msg in history {
-            if let Ok(j) = Self::to_litert_message_json(msg) {
-                out.push(j);
-            }
+            out.push(Self::to_litert_message_json(msg)?);
         }
-        serde_json::to_string(&out).ok()
+        serde_json::to_string(&out)
+            .map(Some)
+            .map_err(|e| BackendError::Internal(e.to_string()))
     }
 
     fn create_ephemeral_conversation(
@@ -250,16 +415,26 @@ impl LitertBackend {
     ) -> Result<ConversationHandle, BackendError> {
         let (history, _last) = Self::split_history_and_last(request)?;
 
-        let tools_json = Self::tools_json(request);
-        let messages_json = Self::history_json(history);
+        let tools_json = Self::tools_json(request)?;
+        let messages_json = Self::history_json(history)?;
+        let session_config = SessionConfigHandle::from_request(request)?;
 
-        let tools_c = tools_json.as_deref().and_then(|s| CString::new(s).ok());
-        let messages_c = messages_json.as_deref().and_then(|s| CString::new(s).ok());
+        let tools_c = match tools_json.as_deref() {
+            None => None,
+            Some(s) => Some(CString::new(s).map_err(|e| BackendError::Internal(e.to_string()))?),
+        };
+        let messages_c = match messages_json.as_deref() {
+            None => None,
+            Some(s) => Some(CString::new(s).map_err(|e| BackendError::Internal(e.to_string()))?),
+        };
 
         let config_ptr = unsafe {
             ffi::litert_lm_conversation_config_create(
                 self.engine.ptr.as_ptr(),
-                std::ptr::null(),
+                session_config
+                    .as_ref()
+                    .map(|c| c.ptr.as_ptr() as *const ffi::LiteRtLmSessionConfig)
+                    .unwrap_or(std::ptr::null()),
                 std::ptr::null(),
                 tools_c
                     .as_ref()
@@ -440,6 +615,87 @@ unsafe extern "C" fn stream_callback(
 
 struct EngineSettingsHandle {
     ptr: NonNull<ffi::LiteRtLmEngineSettings>,
+}
+
+struct SessionConfigHandle {
+    ptr: NonNull<ffi::LiteRtLmSessionConfig>,
+}
+
+impl SessionConfigHandle {
+    fn from_request(request: &ChatCompletionRequest) -> Result<Option<Self>, BackendError> {
+        let wants_max_tokens = request.max_tokens.is_some();
+        let wants_sampling = request.temperature.is_some()
+            || request.top_p.is_some()
+            || request.extra.get("seed").is_some()
+            || request.extra.get("top_k").is_some();
+
+        if !wants_max_tokens && !wants_sampling {
+            return Ok(None);
+        }
+
+        let cfg = Self::create()?;
+
+        if let Some(max_tokens) = request.max_tokens {
+            unsafe {
+                ffi::litert_lm_session_config_set_max_output_tokens(
+                    cfg.ptr.as_ptr(),
+                    max_tokens as i32,
+                );
+            }
+        }
+
+        if wants_sampling {
+            let temperature = request.temperature.unwrap_or(1.0);
+            let top_p = request.top_p.unwrap_or(1.0);
+            let top_k = request
+                .extra
+                .get("top_k")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(40)
+                .clamp(1, i64::from(i32::MAX)) as i32;
+            let seed = request
+                .extra
+                .get("seed")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+
+            let mut params = ffi::LiteRtLmSamplerParams {
+                r#type: ffi::LiteRtLmSamplerType::TopP,
+                top_k,
+                top_p: top_p as f32,
+                temperature: temperature as f32,
+                seed,
+            };
+
+            // Greedy can be expressed as TopP with k=1.
+            if temperature <= 0.0 {
+                params.top_k = 1;
+                params.top_p = 1.0;
+                params.temperature = 0.0;
+            }
+
+            unsafe {
+                ffi::litert_lm_session_config_set_sampler_params(cfg.ptr.as_ptr(), &params);
+            }
+        }
+
+        Ok(Some(cfg))
+    }
+
+    fn create() -> Result<Self, BackendError> {
+        let ptr = unsafe { ffi::litert_lm_session_config_create() };
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            BackendError::Internal("litert_lm_session_config_create returned null".to_string())
+        })?;
+        Ok(Self { ptr })
+    }
+}
+
+impl Drop for SessionConfigHandle {
+    fn drop(&mut self) {
+        unsafe { ffi::litert_lm_session_config_delete(self.ptr.as_ptr()) }
+    }
 }
 
 impl EngineSettingsHandle {

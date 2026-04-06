@@ -8,6 +8,14 @@ Goal: make LiteRT-LM usable from the broader “OpenAI client ecosystem” (Lang
 - `GET /v1/models`
 - `POST /v1/chat/completions` (incl. streaming SSE)
 
+## Docs
+
+- `docs/README.md`
+- `docs/getting-started.md`
+- `docs/api.md`
+- `docs/architecture.md`
+- `docs/faq.md`
+
 ## Why Rust?
 
 Rust is a strong fit for a cross-platform “local server + FFI” wrapper:
@@ -19,12 +27,16 @@ Rust is a strong fit for a cross-platform “local server + FFI” wrapper:
 
 ## Status
 
-This repo currently provides an OpenAI-compatible server skeleton with a **mock backend**. The LiteRT-LM backend wiring (via C API) is intentionally staged to keep the repo buildable before you set up LiteRT-LM libraries on each platform.
+This repo provides:
+
+- an OpenAI-compatible server skeleton with a **mock backend** (no model), and
+- a LiteRT-LM backend behind `--features litert` (links to LiteRT-LM C API).
 
 ## Run (mock backend)
 
 ```bash
-cargo run -- --listen 127.0.0.1:8080
+cargo install --locked --git https://github.com/lpalbou/LiteRT-LM-Server \
+  && litert-lm-server --listen 127.0.0.1:8080
 ```
 
 Test:
@@ -45,7 +57,7 @@ The `litert` backend is behind a feature flag and requires linking against the L
 ```bash
 export LITERT_LM_LIB_DIR=/path/to/litert-lm-c-lib-dir
 export LITERT_LM_LIB_NAME=engine        # name without `lib` prefix / extension
-export LITERT_LM_LINK_KIND=dylib        # or: static
+export LITERT_LM_LINK_KIND=static       # recommended when linking Bazel-built `libengine*.a`
 
 cargo run --features litert -- \
   --backend litert \
@@ -57,7 +69,7 @@ cargo run --features litert -- \
 Notes:
 
 - The server currently focuses on the **Conversation** C API (JSON messages in, JSON messages out).
-- Tool calling is passed through as OpenAI-style `tools` input; mapping tool-call outputs is implemented for non-stream responses and will be refined.
+- Multimodal request mapping (image/audio inputs) is supported for the LiteRT-LM backend.
 
 ## Mobile reality check (iOS/Android)
 
@@ -72,6 +84,5 @@ This wrapper server is most valuable when you want to reuse existing OpenAI-comp
 
 ## Roadmap
 
-- LiteRT-LM backend via the C API (load `.litertlm`, stream tokens, tool-call mapping).
 - Session strategy to preserve KV-cache across requests (important for “prompt caching” performance).
-- Optional multimodal request mapping (OpenAI content parts → LiteRT-LM image/audio inputs, model-dependent).
+- Broader OpenAI surface area (additional endpoints, richer streaming semantics).

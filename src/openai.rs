@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -44,8 +45,35 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    pub fn content_text(&self) -> Option<&str> {
-        self.content.as_ref()?.as_str()
+    pub fn content_text(&self) -> Option<Cow<'_, str>> {
+        let content = self.content.as_ref()?;
+        match content {
+            Value::String(s) => Some(Cow::Borrowed(s.as_str())),
+            Value::Array(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                            out.push_str(text);
+                        }
+                    }
+                }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Owned(out))
+                }
+            }
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                        return Some(Cow::Borrowed(text));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 }
 
